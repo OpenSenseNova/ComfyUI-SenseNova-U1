@@ -2,6 +2,8 @@
 
 ComfyUI custom nodes for SenseNova-U1 API and local inference.
 
+> Requires a ComfyUI build that ships the v3 node API (`comfy_api.latest`). The nodes are registered through `comfy_entrypoint()`; older ComfyUI installs that only support the v1 `NODE_CLASS_MAPPINGS` registration will not load them.
+
 ## Nodes
 
 - `SenseNova Image Generate`: calls the U1-Fast image API.
@@ -46,12 +48,14 @@ Restart ComfyUI after installation.
 
 ## Workflows
 
-Example workflows live in `workflows/`:
+Example workflows live in `workflows/`. Each links to a screenshot of the loaded graph in `docs/`:
 
-- `api_u1_fast_t2i.json`: API U1-Fast text-to-image.
-- `local_t2i.json`: local SenseNova-U1 text-to-image.
-- `local_editing.json`: local SenseNova-U1 image editing.
-- `local_interleave.json`: local SenseNova-U1 interleaved generation.
+| Workflow | Description | Preview |
+| --- | --- | --- |
+| `api_u1_fast_t2i.json` | API U1-Fast text-to-image | ![api_u1_fast_t2i](docs/api_u1_fast_t2i.jpg) |
+| `local_t2i.json` | Local SenseNova-U1 text-to-image | ![t2i](docs/t2i.jpg) |
+| `local_editing.json` | Local SenseNova-U1 image editing | ![editing](docs/editing.jpg) |
+| `local_interleave.json` | Local SenseNova-U1 interleaved generation | ![interleave](docs/interleave.jpg) |
 
 Drag a workflow JSON into ComfyUI, then update `model_path`, `device`, `device_map`, and prompt
 settings as needed. For a smoke test, set `num_steps` to `1` or `2` before returning to the
@@ -67,6 +71,28 @@ export SN_BASE_URL="https://token.sensenova.cn/v1"
 ```
 
 Tokens are not exposed as node inputs, so they are not saved into ComfyUI workflows.
+
+## GGUF Quantized Checkpoints
+
+The `SenseNova U1 Local Loader` exposes an optional `gguf_checkpoint` dropdown
+populated from `<comfyui>/models/gguf/` and the stock ComfyUI
+`<comfyui>/models/diffusion_models/` folder (the default location used by
+ComfyUI-GGUF style distributions). When a file is selected, weights are loaded
+through `diffusers`' GGUF quantizer (dequantizing `nn.Linear` -> `GGUFLinear`)
+instead of safetensors; config and tokenizer still come from `model_path`. The
+default empty selection keeps the safetensors path.
+
+Drop your `.gguf` file into either folder and restart ComfyUI to refresh the
+dropdown.
+
+Requirements: install the `gguf` extra in the ComfyUI Python environment, e.g.
+
+```bash
+python -m pip install -e ".[gguf]"     # from this repo, or
+python -m pip install "gguf>=0.10.0" "diffusers>=0.30.0"
+```
+
+`gguf_checkpoint` cannot be combined with a non-`none` `device_map` — pick one.
 
 ## Notes On Samplers
 

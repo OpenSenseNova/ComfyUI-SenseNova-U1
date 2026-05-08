@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import math
@@ -19,6 +20,36 @@ except ImportError:  # pragma: no cover - supports direct imports during tests
     from image_utils import comfy_image_to_pil, pil_to_comfy_image
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _vram_snapshot(label: str, *, device: str = "cuda", reset_peak: bool = False) -> None:
+    """Log allocated/reserved/peak CUDA memory plus pinned-host stats with ``label``.
+
+    Used to trace the VRAM growth that shows up under
+    ``vram_mode='balanced'`` inside ComfyUI but not when the same code runs
+    via ``examples/t2i/inference.py``. Cheap (~1 ms) and never raises so it
+    can be sprinkled liberally; falls back to a no-op when CUDA is missing.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        dev = torch.device(device)
+        alloc = torch.cuda.memory_allocated(dev) / (1024**3)
+        reserved = torch.cuda.memory_reserved(dev) / (1024**3)
+        peak = torch.cuda.max_memory_allocated(dev) / (1024**3)
+        LOGGER.info(
+            "[vram] %-44s | alloc=%6.2f GiB  reserved=%6.2f GiB  peak=%6.2f GiB",
+            label,
+            alloc,
+            reserved,
+            peak,
+        )
+        if reset_peak:
+            torch.cuda.reset_peak_memory_stats(dev)
+    except Exception as exc:  # pragma: no cover - diagnostic only
+        LOGGER.debug("vram snapshot %r failed: %s", label, exc)
 
 
 @contextmanager
@@ -57,6 +88,7 @@ def _progress_hook(model: Any, total_steps: int):
                 pbar.update(1)
             except Exception:
                 pass
+        _vram_snapshot(f"sampling step {counter['n']}/{total_steps}")
         # Log a heartbeat at every multiple of total_steps so users can see
         # multi-image interleave progress past the saturated bar.
         if total_steps and counter["n"] % total_steps == 0:
@@ -144,6 +176,21 @@ CFG_NORM_OPTIONS = ("none", "global", "channel", "cfg_zero_star")
 ATTN_BACKEND_OPTIONS = ("auto", "flash", "sdpa")
 DEVICE_MAP_OPTIONS = ("none", "auto", "balanced", "balanced_low_0", "sequential")
 
+VRAM_MODE_OPTIONS = ("full", "low", "balanced")
+DEFAULT_VRAM_MODE = "full"
+
+# vram_mode -> prefetch_count (the underlying knob on the layer-offload wrapper)
+# 0 = no offload, 1 = synchronous, >=2 = async prefetch this many layers ahead.
+# Absolute VRAM is workload-dependent (KV cache grows with image/text count in
+# interleave mode), so modes describe the *mechanism*, not a fixed budget.
+_VRAM_MODE_TO_PREFETCH: dict[str, int] = {
+    "full": 0,  # no offload, whole model on GPU
+    "low": 1,  # sync per-layer offload, smallest weight footprint, slowest
+    "balanced": 2,  # async prefetch, overlaps H2D with compute
+}
+
+DEFAULT_LAYERS_ATTR = "language_model.model.layers"
+
 _NORM_MEAN = (0.5, 0.5, 0.5)
 _NORM_STD = (0.5, 0.5, 0.5)
 
@@ -168,11 +215,14 @@ class SenseNovaU1LocalModel:
         attn_backend: str = "auto",
         device_map: str = "none",
         max_memory: str = "",
-        offload_folder: str = "",
-        offload_state_dict: bool = False,
+        gguf_checkpoint: str = "",
+        vram_mode: str = DEFAULT_VRAM_MODE,
     ) -> None:
         if not model_path.strip():
             raise RuntimeError("Local model_path cannot be empty.")
+        if vram_mode not in _VRAM_MODE_TO_PREFETCH:
+            raise RuntimeError(f"Unsupported vram_mode={vram_mode!r}. Choose one of {VRAM_MODE_OPTIONS}.")
+        prefetch_count = _VRAM_MODE_TO_PREFETCH[vram_mode]
 
         injected_path = _maybe_add_source_path(sensenova_u1_src)
         model_path = _resolve_local_model_path(model_path)
@@ -185,20 +235,38 @@ class SenseNovaU1LocalModel:
 
         torch_dtype = _resolve_dtype(torch, dtype)
         normalized_device_map = None if device_map == "none" else device_map
+        normalized_gguf = gguf_checkpoint.strip() or None
+        offloading = prefetch_count > 0
+        if offloading and normalized_device_map:
+            LOGGER.warning(
+                "SenseNova U1 loader: vram_mode=%r overrides device_map=%r "
+                "(layer offload is incompatible with accelerate placement).",
+                vram_mode,
+                normalized_device_map,
+            )
+            normalized_device_map = None
+        if normalized_gguf and normalized_device_map:
+            # diffusers' GGUF quantizer skips accelerate sharding — let the user know.
+            raise RuntimeError("gguf_checkpoint cannot be combined with a device_map; pick one.")
         self.device = device
         self.dtype = dtype
         self.model_path = model_path
         self.attn_backend = attn_backend
+        self.gguf_checkpoint = normalized_gguf or ""
+        self.vram_mode = vram_mode
+        self.prefetch_count = int(prefetch_count)
         self.effective_attn_backend = sensenova_u1.effective_attn_backend()
+        _vram_snapshot(f"loader: pre-load (vram_mode={vram_mode})", device=device, reset_peak=True)
         self.model, self.tokenizer = load_model_and_tokenizer(
             model_path,
             dtype=torch_dtype,
             device=device,
             device_map=normalized_device_map,
             max_memory=max_memory or None,
-            offload_folder=offload_folder or None,
-            offload_state_dict=offload_state_dict if offload_state_dict else None,
+            gguf_checkpoint=normalized_gguf,
+            for_offload=offloading,
         )
+        _vram_snapshot(f"loader: post-load (for_offload={offloading})", device=device)
         _maybe_remove_source_path(injected_path)
 
     @property
@@ -209,7 +277,47 @@ class SenseNovaU1LocalModel:
             "dtype": self.dtype,
             "attn_backend": self.attn_backend,
             "effective_attn_backend": self.effective_attn_backend,
+            "gguf_checkpoint": self.gguf_checkpoint,
+            "vram_mode": self.vram_mode,
+            "prefetch_count": self.prefetch_count,
         }
+
+    def _offload_ctx(self):
+        """Return a context manager that yields the model wrapped for layer
+        offload, or a no-op nullcontext yielding ``self.model`` when offload
+        is disabled (``prefetch_count == 0``)."""
+        if self.prefetch_count == 0:
+            return contextlib.nullcontext(self.model)
+
+        torch = _import_torch()
+        from sensenova_u1.utils import offload_layers_async, offload_layers_sync
+
+        target = torch.device(self.device)
+        if self.prefetch_count == 1:
+            inner = offload_layers_sync(self.model, DEFAULT_LAYERS_ATTR, target)
+        else:
+            inner = offload_layers_async(self.model, DEFAULT_LAYERS_ATTR, target, prefetch_count=self.prefetch_count)
+        return self._instrumented_offload_ctx(inner)
+
+    @contextmanager
+    def _instrumented_offload_ctx(self, inner):
+        """Wrap the offload context manager so we can snapshot VRAM at the
+        boundaries that matter when diagnosing leaks across repeated runs in
+        ComfyUI: just before the wrapper is built, just after, and on the way
+        out (after teardown + ``model.to('cpu')`` + ``empty_cache``).
+        """
+        _vram_snapshot(
+            f"offload_ctx: enter (prefetch_count={self.prefetch_count}, vram_mode={self.vram_mode})",
+            device=self.device,
+            reset_peak=True,
+        )
+        try:
+            with inner as offloaded:
+                _vram_snapshot("offload_ctx: wrapper ready", device=self.device)
+                yield offloaded
+                _vram_snapshot("offload_ctx: forward done (pre-teardown)", device=self.device)
+        finally:
+            _vram_snapshot("offload_ctx: exit (post-teardown+empty_cache)", device=self.device)
 
     def text_to_image(
         self,
@@ -230,8 +338,13 @@ class SenseNovaU1LocalModel:
             raise RuntimeError("Text-to-image prompt cannot be empty.")
 
         _check_cfg_interval(cfg_interval)
-        with _progress_hook(self.model, num_steps):
-            out = self.model.t2i_generate(
+        torch = _import_torch()
+        with (
+            torch.inference_mode(),
+            self._offload_ctx() as offloaded,
+            _progress_hook(self.model, num_steps),
+        ):
+            out = offloaded.t2i_generate(
                 self.tokenizer,
                 prompt,
                 image_size=(width, height),
@@ -300,9 +413,14 @@ class SenseNovaU1LocalModel:
             target_pixels=target_pixels,
         )
         _check_cfg_interval(cfg_interval)
+        torch = _import_torch()
 
-        with _progress_hook(self.model, num_steps):
-            out = self.model.it2i_generate(
+        with (
+            torch.inference_mode(),
+            self._offload_ctx() as offloaded,
+            _progress_hook(self.model, num_steps),
+        ):
+            out = offloaded.it2i_generate(
                 self.tokenizer,
                 prompt,
                 [pil_image],
@@ -367,11 +485,16 @@ class SenseNovaU1LocalModel:
             input_images.append(pil_image)
 
         _check_cfg_interval(cfg_interval)
+        torch = _import_torch()
         # Interleave can emit multiple images, each running num_steps sampling
         # steps. The bar saturates at the first image; subsequent images are
         # tracked via LOGGER (one line per completed image).
-        with _progress_hook(self.model, num_steps):
-            text, image_tensors = self.model.interleave_gen(
+        with (
+            torch.inference_mode(),
+            self._offload_ctx() as offloaded,
+            _progress_hook(self.model, num_steps),
+        ):
+            text, image_tensors = offloaded.interleave_gen(
                 self.tokenizer,
                 prompt,
                 images=input_images,
@@ -569,16 +692,13 @@ def _import_sensenova_u1():
     try:
         import sensenova_u1
         from sensenova_u1.models.neo_unify.utils import smart_resize
+        from sensenova_u1.utils import load_model_and_tokenizer
     except ImportError as exc:
         raise RuntimeError(
             "Local SenseNova-U1 inference requires the sensenova_u1 package. "
             "Install this repository into the ComfyUI Python environment, set "
             "SENSENOVA_U1_SRC, or fill the loader's sensenova_u1_src input."
         ) from exc
-    try:
-        from sensenova_u1.utils import load_model_and_tokenizer
-    except ImportError:
-        load_model_and_tokenizer = _load_model_and_tokenizer
     return sensenova_u1, load_model_and_tokenizer, smart_resize
 
 
@@ -591,67 +711,6 @@ def _resolve_local_model_path(model_path: str) -> str:
         return snapshot_download(model_path, local_files_only=True)
     except Exception:
         return model_path
-
-
-def _load_model_and_tokenizer(
-    model_path: str,
-    *,
-    dtype,
-    device: str,
-    device_map: str | None = None,
-    max_memory: str | None = None,
-    offload_folder: str | None = None,
-    offload_state_dict: bool | None = None,
-):
-    try:
-        from transformers import AutoConfig, AutoModel, AutoTokenizer
-
-        from sensenova_u1 import check_checkpoint_compatibility
-    except ImportError as exc:
-        raise RuntimeError(
-            "Local SenseNova-U1 inference requires transformers and the sensenova_u1 package "
-            "in the ComfyUI Python environment."
-        ) from exc
-
-    model_path = _resolve_local_model_path(model_path)
-    config = AutoConfig.from_pretrained(model_path)
-    check_checkpoint_compatibility(config)
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model_kwargs: dict[str, Any] = {
-        "config": config,
-        "torch_dtype": dtype,
-    }
-    if device_map:
-        model_kwargs["device_map"] = device_map
-        parsed_max_memory = _parse_max_memory(max_memory or "")
-        if parsed_max_memory:
-            model_kwargs["max_memory"] = parsed_max_memory
-        if offload_folder:
-            model_kwargs["offload_folder"] = offload_folder
-        if offload_state_dict is not None:
-            model_kwargs["offload_state_dict"] = offload_state_dict
-
-    model = AutoModel.from_pretrained(model_path, **model_kwargs).eval()
-    if not device_map:
-        model = model.to(device)
-    return model, tokenizer
-
-
-def _parse_max_memory(value: str) -> dict[int | str, str]:
-    result: dict[int | str, str] = {}
-    for item in value.split(","):
-        item = item.strip()
-        if not item:
-            continue
-        if "=" not in item:
-            raise RuntimeError("max_memory entries must look like 0=20GiB,cpu=64GiB.")
-        key, memory = item.split("=", 1)
-        key = key.strip()
-        memory = memory.strip()
-        if not key or not memory:
-            raise RuntimeError("max_memory entries must include both device and memory.")
-        result[int(key) if key.isdigit() else key] = memory
-    return result
 
 
 def _resolve_dtype(torch, dtype: str):
