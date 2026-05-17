@@ -2,3 +2,7 @@ httpx
 numpy
 pillow
 python-dotenv
+# Local inference path. End users installed via Comfy Manager get this from
+# git; monorepo developers can `pip install -e .` from the repo root instead
+# and skip this line via `pip install -r requirements.txt --no-deps` if needed.
+sensenova-u1 @ git+https://github.com/OpenSenseNova/SenseNova-U1.git@main
