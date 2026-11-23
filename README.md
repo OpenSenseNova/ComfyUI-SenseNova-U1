@@ -2,11 +2,10 @@
 
 ComfyUI custom nodes for SenseNova-U1 API and local inference.
 
-> Source of truth lives in [`OpenSenseNova/SenseNova-U1`](https://github.com/OpenSenseNova/SenseNova-U1)
-> under `apps/comfyui/`. The standalone repo
-> [`OpenSenseNova/ComfyUI-SenseNova-U1`](https://github.com/OpenSenseNova/ComfyUI-SenseNova-U1)
-> is a read-only publish mirror used by Comfy Registry; please open PRs against
-> the monorepo.
+This repository is the maintenance and release home for the optional SenseNova
+custom-node package. Open issues and pull requests for the plugin here. For
+workflows that use ComfyUI's built-in SenseNova nodes, see the
+[SenseNova-U1 model catalog](https://github.com/OpenSenseNova/SenseNova-U1/blob/main/docs/models.md#comfyui-and-other-integrations).
 
 > Requires a ComfyUI build that ships the v3 node API (`comfy_api.latest`). The nodes are registered through `comfy_entrypoint()`; older ComfyUI installs that only support the v1 `NODE_CLASS_MAPPINGS` registration will not load them.
 
@@ -50,25 +49,19 @@ API image models from TokenPlan instead of using a hard-coded model list, and
 ships refreshed ComfyUI workflows for the new loader, text-to-image, image
 editing, and API generation paths.
 
-### Developer install (from the SenseNova-U1 monorepo)
+### Developer install
 
-If you're hacking on the nodes alongside the model source:
+Run these commands from this plugin checkout using the Python environment
+that runs ComfyUI.
 
 ```bash
-python apps/comfyui/install.py --comfyui /path/to/ComfyUI
-python -m pip install httpx numpy pillow python-dotenv
-python -m pip install -e .  # install sensenova-u1 from src/
+python -m pip install -r requirements.txt
+python install.py --comfyui /path/to/ComfyUI
 ```
 
-`install.py` symlinks (or copies, with `--copy`) `apps/comfyui/` into
-`<ComfyUI>/custom_nodes/ComfyUI-SenseNova-U1`. The link only controls how
-ComfyUI discovers the node files; the node imports `sensenova_u1` from the
-ComfyUI Python environment. Keep the editable install above when developing
-from this monorepo, then restart ComfyUI.
-
-If an editable install is unavailable, developers can explicitly set
-`SENSENOVA_U1_SRC=/path/to/SenseNova-U1/src`. The node never infers a package
-source from the symlink location.
+The installer links this checkout into `<ComfyUI>/custom_nodes/ComfyUI-SenseNova-U1`.
+Restart ComfyUI to load the nodes. The pinned `sensenova-u1` dependency in
+`requirements.txt` provides the runtime for local inference.
 
 ## Workflows
 
